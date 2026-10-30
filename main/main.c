@@ -11,21 +11,20 @@
 #include "driver/gpio.h"
 
 // Sensores de classificacao / fim de curso (entradas, ativos em nivel alto)
-#define SENSOR_PEQUENO_PIN     GPIO_NUM_32 // sp   - barreira optica: objeto pequeno
-#define SENSOR_MEDIO_PIN       GPIO_NUM_33 // sm   - barreira optica: objeto medio
-#define SENSOR_GRANDE_PIN      GPIO_NUM_25 // sg   - barreira optica: objeto grande
+#define SENSOR_PEQUENO_PIN     GPIO_NUM_15 // sp   - barreira optica: objeto pequeno
+#define SENSOR_MEDIO_PIN       GPIO_NUM_17 // sm   - barreira optica: objeto medio
+#define SENSOR_GRANDE_PIN      GPIO_NUM_8 // sg   - barreira optica: objeto grande
 #define SENSOR_METAL_PIN       GPIO_NUM_26 // Smet - sensor indutivo: objeto metalico
 #define FIM_CURSO_BRACO_P_PIN  GPIO_NUM_27 // fBp  - cilindro pequeno em repouso
 #define FIM_CURSO_BRACO_M_PIN  GPIO_NUM_14 // fBm  - cilindro medio em repouso
 #define FIM_CURSO_BRACO_G_PIN  GPIO_NUM_4  // fBg  - cilindro grande em repouso
-#define BOTAO_PIN              GPIO_NUM_23 // botao - botao de controle
 
 // Atuadores (saidas)
-#define SOLENOIDE_BRACO_P_PIN  GPIO_NUM_18 // iBp - valvula do cilindro pequeno
-#define SOLENOIDE_BRACO_M_PIN  GPIO_NUM_19 // iBm - valvula do cilindro medio
-#define SOLENOIDE_BRACO_G_PIN  GPIO_NUM_21 // iBg - valvula do cilindro grande
-#define SOLENOIDE_BRACO_G_VOLTA GPIO_NUM_5  // iBgV - valvula do cilindro grande (volta)
-#define MOTOR_ESTEIRA_PIN      GPIO_NUM_22 // ie/fe - rele do motor da esteira
+#define SOLENOIDE_BRACO_P_PIN  GPIO_NUM_13 // iBp - valvula do cilindro pequeno
+#define SOLENOIDE_BRACO_M_PIN  GPIO_NUM_12 // iBm - valvula do cilindro medio
+#define SOLENOIDE_BRACO_G_PIN  GPIO_NUM_11 // iBg - valvula do cilindro grande
+#define SOLENOIDE_BRACO_G_VOLTA GPIO_NUM_10  // iBgV - valvula do cilindro grande (volta)
+#define MOTOR_ESTEIRA_PIN      GPIO_NUM_9 // ie/fe - rele do motor da esteira
 
 #define DEBOUNCE_STABLE_READS 8  // leituras consecutivas iguais para validar (~80ms a 10ms/loop)
 // Duracao do pulso de cada braco (solenoide). Cada braco pode ter um tempo
@@ -114,10 +113,9 @@ typedef struct {
 enum { PULSE_BRACO_P, PULSE_BRACO_M, PULSE_BRACO_G, PULSE_BRACO_G_VOLTA, PULSE_COUNT };
 
 // --- Modo passo-a-passo da esteira ---
-// A partir do aperto do botao, a esteira anda por ESTEIRA_PASSO e em seguida
-// fica parada por ESTEIRA_PASSO, repetindo indefinidamente.
-static bool belt_stepping = false;      // true depois que o botao foi apertado
-static bool belt_moving = false;        // fase atual: true=andando, false=parada
+// Desde que o ESP liga, a esteira anda por ESTEIRA_PASSO e em seguida fica
+// parada por ESTEIRA_PASSO, repetindo indefinidamente.
+static bool belt_moving = false;       // fase atual: true=andando, false=parada
 static TickType_t belt_step_tick = 0;   // instante em que a fase atual comecou
 
 static PulseOutput pulse_outputs[PULSE_COUNT] = {
@@ -150,7 +148,6 @@ void update_pulses(void) {
 
 typedef struct {
   gpio_num_t pin;
-  Event *event;     // != NULL apenas para entradas que disparam evento (botao)
   int last_level;
   int candidate_level;
   int stable_count;
@@ -159,14 +156,13 @@ typedef struct {
 // Os sensores de classificacao (pequeno/medio/grande) nao entram aqui: o medio e
 // tratado por interrupcao (sensor_medio_isr) e o pequeno e lido por nivel na
 // parada (classifica_no_sensor).
-enum { IN_SMET, IN_FBP, IN_FBM, IN_FBG, IN_BOTAO, IN_COUNT };
+enum { IN_SMET, IN_FBP, IN_FBM, IN_FBG, IN_COUNT };
 
 static DebouncedInput debounced_inputs[IN_COUNT] = {
   [IN_SMET] = {.pin = SENSOR_METAL_PIN},
   [IN_FBP]  = {.pin = FIM_CURSO_BRACO_P_PIN},
   [IN_FBM]  = {.pin = FIM_CURSO_BRACO_M_PIN},
   [IN_FBG]  = {.pin = FIM_CURSO_BRACO_G_PIN},
-  [IN_BOTAO] = {.pin = BOTAO_PIN,            .event = &botao},
 };
 
 // Interrupcao do sensor MEDIO (borda de subida). O sensor medio fica antes do
@@ -235,9 +231,6 @@ static void on_belt_stop(void) {
 // A cada transicao andar->parar avanca o registrador (on_belt_stop), que le a
 // peca parada sobre o sensor pequeno e a coloca na posicao 1.
 void update_belt_step(void) {
-  if (!belt_stepping) {
-    return;
-  }
   if ((xTaskGetTickCount() - belt_step_tick) >= pdMS_TO_TICKS(ESTEIRA_PASSO)) {
     belt_moving = !belt_moving;
     gpio_set_level(MOTOR_ESTEIRA_PIN, belt_moving ? 1 : 0);
@@ -249,11 +242,9 @@ void update_belt_step(void) {
   }
 }
 
-// Ao apertar o botao, inicia o modo passo-a-passo: a esteira comeca a andar
+// Inicia o modo passo-a-passo ao ligar o ESP: a esteira comeca a andar
 // (primeiro passo) e a partir dai alterna andar/parar a cada ESTEIRA_PASSO.
-void action_botao(const Event *event) {
-  default_action(event);
-  belt_stepping = true;
+void start_belt(void) {
   belt_moving = true;
   gpio_set_level(MOTOR_ESTEIRA_PIN, 1);
   belt_step_tick = xTaskGetTickCount();
@@ -274,12 +265,8 @@ void poll_input(DebouncedInput *input) {
 
   if (input->stable_count == DEBOUNCE_STABLE_READS &&
       input->candidate_level != input->last_level) {
+    // metal/fim de curso apenas mantem last_level para consulta
     input->last_level = input->candidate_level;
-    // Entradas com evento (botao) sinalizam ao supervisor na borda de subida.
-    // As demais (metal/fim de curso) apenas mantem last_level para consulta.
-    if (input->candidate_level == 1 && input->event != NULL) {
-      trigger_event(input->event);
-    }
   }
 }
 
@@ -336,10 +323,11 @@ void setup_gpio(void) {
 
 void setup(void) {
   printf("Start supervisor!\n\n");
-  // O acionamento dos bracos agora e feito diretamente pela memoria da esteira
-  // (esteira_mem) em on_belt_stop(); o supervisor so trata o 'botao'.
-  set_event_action(&botao, action_botao);
+  // O acionamento dos bracos e feito diretamente pela memoria da esteira
+  // (esteira_mem) em on_belt_stop(). Nao ha mais botao de inicio: a esteira
+  // comeca a andar assim que o ESP liga, depois de configurar os GPIOs.
   setup_gpio();
+  start_belt();
 }
 
 void loop(void) {
